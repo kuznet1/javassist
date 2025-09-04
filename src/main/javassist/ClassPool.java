@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.Hashtable;
 import java.util.Iterator;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javassist.bytecode.ClassFile;
 import javassist.bytecode.Descriptor;
@@ -123,14 +124,12 @@ public class ClassPool {
 
     protected ClassPoolTail source;
     protected ClassPool parent;
-    protected Hashtable classes;        // should be synchronous
+    protected ConcurrentHashMap<String, CtClass> classes = new ConcurrentHashMap<>();        // should be synchronous
 
     /**
      * Table of registered cflow variables.
      */
     private Hashtable cflow = null;     // should be synchronous.
-
-    private static final int INIT_HASH_SIZE = 191;
 
     private ArrayList importedPackages;
 
@@ -164,7 +163,6 @@ public class ClassPool {
      * @see javassist.ClassPool#getDefault()
      */
     public ClassPool(ClassPool parent) {
-        this.classes = new Hashtable(INIT_HASH_SIZE);
         this.source = new ClassPoolTail();
         this.parent = parent;
         if (parent == null) {
@@ -393,14 +391,13 @@ public class ClassPool {
      * CtClass object from the hash table and inserts it with the new
      * name.  Don't delegate to the parent.
      */
-    synchronized void classNameChanged(String oldname, CtClass clazz) {
-        CtClass c = (CtClass)getCached(oldname);
-        if (c == clazz)             // must check this equation.
-            removeCached(oldname);  // see getAndRename().
-
-        String newName = clazz.getName();
-        checkNotFrozen(newName);
-        cacheCtClass(newName, clazz, false);
+    void classNameChanged(String oldname, CtClass clazz) {
+        // must check this equation, see getAndRename().
+        classes.computeIfPresent(oldname, (__, v) -> v == clazz ? null : v);
+        classes.compute(clazz.getName(), (k, v) -> {
+            checkNotFrozen(k, v);
+            return clazz;
+        });
     }
 
     /**
@@ -499,28 +496,18 @@ public class ClassPool {
      * @param useCache      false if the cached CtClass must be ignored.
      * @return null     if the class could not be found.
      */
-    protected synchronized CtClass get0(String classname, boolean useCache)
+    protected CtClass get0(String classname, boolean useCache)
         throws NotFoundException
     {
         CtClass clazz = null;
-        if (useCache) {
-            clazz = getCached(classname);
-            if (clazz != null)
-                return clazz;
-        }
-
         if (!childFirstLookup && parent != null) {
             clazz = parent.get0(classname, useCache);
             if (clazz != null)
                 return clazz;
         }
 
-        clazz = createCtClass(classname, useCache);
+        clazz = getOrCreate(classname, useCache);
         if (clazz != null) {
-            // clazz.getName() != classname if classname is "[L<name>;".
-            if (useCache)
-                cacheCtClass(clazz.getName(), clazz, false);
-
             return clazz;
         }
 
@@ -531,12 +518,16 @@ public class ClassPool {
     }
 
     /**
+     * @deprecated
+     * Use {@link #getOrCreate(String classname, boolean useCache)} instead.
+     * <p>
      * Creates a CtClass object representing the specified class.
      * It first examines whether or not the corresponding class
      * file exists.  If yes, it creates a CtClass object.
      *
      * @return null if the class file could not be found.
      */
+    @Deprecated
     protected CtClass createCtClass(String classname, boolean useCache) {
         // accept "[L<class name>;" as a class name. 
         if (classname.charAt(0) == '[')
@@ -554,6 +545,33 @@ public class ClassPool {
                 return null;
             else
                 return new CtClassType(classname, this);
+    }
+
+    protected CtClass getOrCreate(String classname, boolean useCache) {
+        // accept "[L<class name>;" as a class name.
+        if (classname.charAt(0) == '[') {
+            classname = Descriptor.toClassName(classname);
+        }
+
+        if (classname.endsWith("[]") && getOrCreate(classname.substring(0, classname.indexOf('[')), useCache) == null) {
+            return null;
+        }
+
+        if (!useCache) {
+            return create(classname);
+        }
+
+        return classes.computeIfAbsent(classname, this::create);
+    }
+
+    private CtClass create(String classname) {
+        if (classname.endsWith("[]")) {
+            return new CtArray(classname, this);
+        }
+        if (find(classname) != null) {
+            return new CtClassType(classname, this);
+        }
+        return null;
     }
 
     /**
@@ -578,7 +596,10 @@ public class ClassPool {
      * @see checkNotExists(String)
      */
     void checkNotFrozen(String classname) throws RuntimeException {
-        CtClass clazz = getCached(classname);
+        checkNotFrozen(classname, getCached(classname));
+    }
+
+    private void checkNotFrozen(String classname, CtClass clazz) throws RuntimeException {
         if (clazz == null) {
             if (!childFirstLookup && parent != null) {
                 try {
@@ -831,13 +852,13 @@ public class ClassPool {
      * @param superclass the super class.
      * @throws RuntimeException if the existing class is frozen.
      */
-    public synchronized CtClass makeClass(String classname, CtClass superclass)
+    public CtClass makeClass(String classname, CtClass superclass)
         throws RuntimeException
     {
-        checkNotFrozen(classname);
-        CtClass clazz = new CtNewClass(classname, this, false, superclass);
-        cacheCtClass(classname, clazz, true);
-        return clazz;
+        return classes.compute(classname, (k, v) -> {
+            checkNotFrozen(k, v);
+            return new CtNewClass(k, this, false, superclass);
+        });
     }
 
     /**
@@ -847,11 +868,11 @@ public class ClassPool {
      * @param classname     a fully-qualified class name.
      * @return      the nested class.
      */
-    synchronized CtClass makeNestedClass(String classname) {
-        checkNotFrozen(classname);
-        CtClass clazz = new CtNewClass(classname, this, false, null);
-        cacheCtClass(classname, clazz, true);
-        return clazz;
+    CtClass makeNestedClass(String classname) {
+        return classes.compute(classname, (k, v) -> {
+            checkNotFrozen(k, v);
+            return new CtNewClass(k, this, false, null);
+        });
     }
 
     /**
@@ -875,13 +896,13 @@ public class ClassPool {
      * @param superclass the super interface.
      * @throws RuntimeException if the existing interface is frozen.
      */
-    public synchronized CtClass makeInterface(String name, CtClass superclass)
+    public CtClass makeInterface(String name, CtClass superclass)
         throws RuntimeException
     {
-        checkNotFrozen(name);
-        CtClass clazz = new CtNewClass(name, this, true, superclass);
-        cacheCtClass(name, clazz, true);
-        return clazz;
+        return classes.compute(name, (k, v) -> {
+            checkNotFrozen(k, v);
+            return new CtNewClass(k, this, true, superclass);
+        });
     }
 
     /**
