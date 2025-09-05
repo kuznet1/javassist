@@ -500,6 +500,12 @@ public class ClassPool {
         throws NotFoundException
     {
         CtClass clazz = null;
+        if (useCache) {
+            clazz = getCached(classname);
+            if (clazz != null)
+                return clazz;
+        }
+
         if (!childFirstLookup && parent != null) {
             clazz = parent.get0(classname, useCache);
             if (clazz != null)
